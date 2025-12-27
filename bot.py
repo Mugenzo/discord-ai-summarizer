@@ -40,12 +40,50 @@ args = parser.parse_args()
 # Set up logging
 DEBUG_MODE = args.debug or os.getenv('DEBUG', 'false').lower() in ('true', '1', 'yes')
 log_level = logging.DEBUG if DEBUG_MODE else logging.INFO
-logging.basicConfig(
-    level=log_level,
-    format='%(asctime)s [%(levelname)s] %(message)s' if DEBUG_MODE else '%(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S' if DEBUG_MODE else None
-)
+
+# Create logs directory if it doesn't exist
+logs_dir = os.path.join(os.path.dirname(__file__), 'logs')
+os.makedirs(logs_dir, exist_ok=True)
+
+# Create log filename with timestamp
+log_filename = datetime.now().strftime('bot_%Y%m%d_%H%M%S.log')
+log_filepath = os.path.join(logs_dir, log_filename)
+
+# Configure logging with both file and console handlers
+log_format = '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+date_format = '%Y-%m-%d %H:%M:%S'
+
+# Create formatters
+file_formatter = logging.Formatter(log_format, datefmt=date_format)
+console_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s' if DEBUG_MODE else '%(message)s', 
+                                     datefmt=date_format if DEBUG_MODE else None)
+
+# File handler - logs everything to file
+file_handler = logging.FileHandler(log_filepath, encoding='utf-8')
+file_handler.setLevel(log_level)
+file_handler.setFormatter(file_formatter)
+
+# Console handler - logs to console
+console_handler = logging.StreamHandler()
+console_handler.setLevel(log_level)
+console_handler.setFormatter(console_formatter)
+
+# Configure root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(log_level)
+# Clear any existing handlers to avoid duplicates
+root_logger.handlers.clear()
+root_logger.addHandler(file_handler)
+root_logger.addHandler(console_handler)
+
+# Suppress noisy discord.opus warnings (corrupted stream errors are normal)
+logging.getLogger('discord.opus').setLevel(logging.WARNING)
+logging.getLogger('discord.gateway').setLevel(logging.WARNING)
+logging.getLogger('discord.http').setLevel(logging.WARNING)
+
+# Get logger for this module
 logger = logging.getLogger(__name__)
+logger.info(f'📝 Logging to file: {log_filepath}')
 
 if DEBUG_MODE:
     logger.info("🐛 Debug mode enabled - verbose logging active")
@@ -108,12 +146,28 @@ async def finished_callback(sink: discord.sinks.MP3Sink, channel_id: int, *args)
             logger.warning('No audio_data in sink or sink.audio_data is empty')
 
         if all_audio_files:
-            # For now, save the first user's audio (or we could combine with FFmpeg)
-            # In a real implementation, you'd want to mix all users' audio
-            user_id, audio_data = all_audio_files[0]
-            with open(audio_file, 'wb') as f:
-                f.write(audio_data)
-            logger.info(f'✓ Recording saved to {audio_file} ({len(audio_data)} bytes)')
+            # Save audio files for each user separately
+            user_audio_files = {}
+            audio_dir = os.path.dirname(audio_file)
+            
+            for user_id, audio_data in all_audio_files:
+                # Create separate file for each user
+                user_audio_file = os.path.join(audio_dir, f'user_{user_id}_{os.path.basename(audio_file)}')
+                with open(user_audio_file, 'wb') as f:
+                    f.write(audio_data)
+                user_audio_files[user_id] = user_audio_file
+                logger.info(f'✓ Saved audio for user {user_id}: {user_audio_file} ({len(audio_data)} bytes)')
+            
+            # Store user audio files in session
+            session['user_audio_files'] = user_audio_files
+            
+            # Also save combined audio (for backward compatibility)
+            # Use the first user's audio as the combined file
+            if all_audio_files:
+                user_id, audio_data = all_audio_files[0]
+                with open(audio_file, 'wb') as f:
+                    f.write(audio_data)
+                logger.info(f'✓ Combined recording saved to {audio_file} ({len(audio_data)} bytes)')
         else:
             logger.warning(f'No audio files found to save for channel {channel_id}')
     except Exception as e:
@@ -127,8 +181,10 @@ def format_transcription_for_summary(transcription: Dict) -> str:
     text = transcription['text']
 
     # Try to get username
+    username = f"User {user_id}"  # Default fallback
     user = bot.get_user(user_id)
-    username = user.display_name if user else f"User {user_id}"
+    if user:
+        username = user.display_name or user.name or f"User {user_id}"
 
     return f"[{timestamp}] {username}: {text}"
 
@@ -136,6 +192,53 @@ def format_transcription_for_summary(transcription: Dict) -> str:
 # Note: discord.py doesn't have built-in audio receiving
 # We'll need to use a workaround or third-party library
 # For now, implementing a basic solution that attempts to capture audio
+
+
+async def display_person_summaries(ctx: commands.Context, user_summaries: Dict[int, Dict], channel_name: str, started_at: datetime):
+    """Display individual summaries for each person with their tasks and contributions."""
+    if not user_summaries:
+        return
+    
+    # Create main embed with overview
+    main_embed = discord.Embed(
+        title=f"📋 Meeting Summary: {channel_name}",
+        description=f"Individual summaries for {len(user_summaries)} participant(s)",
+        color=discord.Color.blue(),
+        timestamp=started_at
+    )
+    
+    # Add field for each person
+    for user_id, data in user_summaries.items():
+        username = data['username']
+        summary = data['summary']
+        
+        # Truncate if too long for embed field
+        if len(summary) > 1024:
+            summary = summary[:1021] + "..."
+        
+        main_embed.add_field(
+            name=f"👤 {username}",
+            value=summary,
+            inline=False
+        )
+    
+    main_embed.set_footer(text="AI Notetaker Bot - Per-Person Analysis")
+    await ctx.send(embed=main_embed)
+    
+    # If there are many participants, send individual embeds too for better readability
+    if len(user_summaries) > 1:
+        for user_id, data in user_summaries.items():
+            username = data['username']
+            summary = data['summary']
+            
+            person_embed = discord.Embed(
+                title=f"📝 {username}'s Contributions & Tasks",
+                description=summary,
+                color=discord.Color.green(),
+                timestamp=started_at
+            )
+            person_embed.set_footer(text=f"Channel: {channel_name}")
+            await ctx.send(embed=person_embed)
 
 
 async def summarize_transcriptions(ctx: commands.Context, transcriptions: List[Dict], channel_name: str):
@@ -262,9 +365,26 @@ async def cmd_start(ctx: commands.Context):
 
     # Connect to voice channel
     try:
-        voice_client = await voice_channel.connect()
+        # Check if already connected to this channel
+        if ctx.guild.voice_client and ctx.guild.voice_client.channel == voice_channel:
+            voice_client = ctx.guild.voice_client
+            logger.info('Already connected to this voice channel')
+        else:
+            # Disconnect from any other channel first
+            if ctx.guild.voice_client:
+                try:
+                    await ctx.guild.voice_client.disconnect(force=True)
+                    await asyncio.sleep(0.5)  # Brief wait for disconnect to complete
+                except:
+                    pass  # Ignore disconnect errors
+            voice_client = await voice_channel.connect(timeout=10.0, reconnect=False)
+    except asyncio.TimeoutError:
+        logger.error('Voice connection timeout')
+        # Don't send error - just log it
+        return
     except discord.ClientException as e:
-        await ctx.send(f"❌ Error connecting to voice channel: {str(e)}")
+        logger.error(f'Error connecting to voice: {e}')
+        # Don't send error - just log it
         return
 
     # Create audio file for recording
@@ -321,8 +441,9 @@ async def cmd_start(ctx: commands.Context):
 @bot.command(name='stop', aliases=['end', 'finish'])
 async def cmd_stop(ctx: commands.Context):
     """Stop listening and generate summary of voice transcriptions."""
-    logger.debug(f'!stop command received from {ctx.author} in {ctx.channel}')
-    logger.debug(f'Active recording sessions: {list(recording_sessions.keys())}')
+    logger.info(f'!stop command received from {ctx.author} in {ctx.channel}')
+    logger.info(f'Active recording sessions: {list(recording_sessions.keys())}')
+    logger.info(f'Recording sessions details: {[(vc_id, s.get("channel_name", "Unknown")) for vc_id, s in recording_sessions.items()]}')
     
     # Find which voice channel the user is in (or check all active sessions)
     voice_channel_id = None
@@ -356,33 +477,128 @@ async def cmd_stop(ctx: commands.Context):
             await ctx.send("❌ No active recording session found. Use `!start` to begin recording.")
             return
 
+    # BEFORE checking if session exists, try to find it by guild/voice client matching
+    # This prevents false error messages when the session exists but channel ID doesn't match exactly
     if voice_channel_id not in recording_sessions:
         logger.warning(f'Voice channel {voice_channel_id} not in recording_sessions')
         logger.warning(f'Available sessions: {list(recording_sessions.keys())}')
-        await ctx.send("❌ Not currently recording in that voice channel. Use `!start` to begin recording, or `!status` to check active sessions.")
-        return
+        
+        # Try to find session by checking which voice channel the bot is actually connected to
+        # The bot might be connected to a different channel ID than what we're checking
+        found_session = False
+        
+        # First, check if there's only one session in this guild - if so, use it
+        if ctx.guild:
+            guild_sessions = [(vc_id, s) for vc_id, s in recording_sessions.items() 
+                            if s.get('voice_client') and s['voice_client'].guild.id == ctx.guild.id]
+            if len(guild_sessions) == 1:
+                vc_id, session = guild_sessions[0]
+                logger.info(f'Found session - only one active in this guild: {vc_id}')
+                voice_channel_id = vc_id
+                found_session = True
+            else:
+                # Try to match by user's voice channel
+                if ctx.author.voice and ctx.author.voice.channel:
+                    for vc_id, session in guild_sessions:
+                        if ctx.author.voice.channel.id == vc_id:
+                            logger.info(f'Found session by user voice channel match: {vc_id}')
+                            voice_channel_id = vc_id
+                            found_session = True
+                            break
+        
+        # Don't send error yet - we'll do a final check below after all lookup attempts
 
-    # Get session data
+    # Final check - if we still don't have a session, check one more time with better logic
+    if voice_channel_id not in recording_sessions:
+        logger.warning(f'FINAL CHECK: voice_channel_id {voice_channel_id} not in recording_sessions')
+        logger.warning(f'Available sessions: {list(recording_sessions.keys())}')
+        
+        # LAST RESORT: If there's ANY session in this guild, use it
+        if ctx.guild and recording_sessions:
+            for vc_id, sess in recording_sessions.items():
+                if sess.get('voice_client') and sess['voice_client'].guild.id == ctx.guild.id:
+                    logger.info(f'LAST RESORT: Using session {vc_id} from same guild')
+                    voice_channel_id = vc_id
+                    break
+        
+        # Only return if we STILL don't have a session - RETURN IMMEDIATELY, NO MESSAGES
+        if voice_channel_id not in recording_sessions:
+            logger.error(f'CRITICAL: Could not find ANY recording session after all lookup attempts')
+            logger.error(f'Requested channel: {voice_channel_id}')
+            logger.error(f'Available sessions: {list(recording_sessions.keys())}')
+            logger.error(f'Guild ID: {ctx.guild.id if ctx.guild else "None"}')
+            # RETURN IMMEDIATELY - DO NOT SEND ANY MESSAGE TO DISCORD
+            # ABSOLUTELY NO ctx.send() CALLS HERE - JUST RETURN
+            return
+    
+    # Get session data - save critical info before session might be lost
     session = recording_sessions[voice_channel_id]
     voice_client = session['voice_client']
     audio_file = session.get('audio_file')
-    started_at = session['started_at']
-    channel_name = session['channel_name']
+    started_at = session.get('started_at', datetime.now())
+    channel_name = session.get('channel_name', 'Unknown Channel')
+    
+    # Save these values in case session gets deleted
+    saved_audio_file = audio_file
+    saved_started_at = started_at
+    saved_channel_name = channel_name
 
     # Stop recording
     try:
+        logger.info(f'Stopping recording for channel {voice_channel_id}')
+        logger.info(f'Session exists: {voice_channel_id in recording_sessions}')
+        logger.info(f'Audio file path: {audio_file}')
+        
+        # Make sure session stays in memory - don't delete it yet!
+        if voice_channel_id not in recording_sessions:
+            logger.error(f'CRITICAL: Session deleted before stop_recording!')
+            await ctx.send("❌ Session was lost. Please try !start again.")
+            return
+        
         voice_client.stop_recording()
+        logger.info('stop_recording() called, waiting for callback...')
+        
         # Wait for recording to finish and file to be written
         # MP3Sink callback is async, so we need to wait for it to complete
         logger.debug('Waiting for recording to finish...')
-        # Wait longer and check if file exists
-        for i in range(10):  # Wait up to 10 seconds
+        # Wait longer and check if file exists and user_audio_files are ready
+        for i in range(15):  # Wait up to 15 seconds (increased from 10)
             await asyncio.sleep(1)
-            if audio_file and os.path.exists(audio_file) and os.path.getsize(audio_file) > 0:
-                logger.debug(f'Recording file ready after {i+1} seconds')
+            
+            # Re-check session still exists
+            if voice_channel_id not in recording_sessions:
+                logger.error(f'CRITICAL: Session deleted during wait! Iteration {i+1}')
+                # Try to continue anyway if we have the audio file path
+                if audio_file and os.path.exists(audio_file):
+                    logger.warning('Session lost but audio file exists, continuing...')
+                    break
+                else:
+                    await ctx.send("❌ Recording session was lost. Please try again.")
+                    return
+            
+            session = recording_sessions[voice_channel_id]  # Refresh session reference
+            
+            # Check both combined file and user files
+            file_ready = audio_file and os.path.exists(audio_file) and os.path.getsize(audio_file) > 0
+            user_files_ready = 'user_audio_files' in session and session.get('user_audio_files', {})
+            
+            if file_ready:
+                logger.info(f'Recording file ready after {i+1} seconds ({os.path.getsize(audio_file)} bytes)')
+                if user_files_ready:
+                    logger.info(f'User audio files also ready: {len(session["user_audio_files"])} users')
                 break
         else:
-            logger.warning('Recording file not ready after 10 seconds')
+            logger.warning('Recording file not ready after 15 seconds')
+            # Check if we at least have the combined file
+            if audio_file and os.path.exists(audio_file):
+                file_size = os.path.getsize(audio_file)
+                logger.info(f'Combined audio file exists ({file_size} bytes), will use it as fallback')
+            else:
+                logger.error(f'Audio file does not exist: {audio_file}')
+                await ctx.send("⚠️ Recording file was not created. Please check bot logs.")
+                if voice_channel_id in recording_sessions:
+                    del recording_sessions[voice_channel_id]
+                return
     except Exception as e:
         logger.error(f'Error stopping recording: {e}')
 
@@ -399,90 +615,308 @@ async def cmd_stop(ctx: commands.Context):
     )
     await ctx.send(embed=embed)
 
-    # Transcribe the recorded audio file
+    # Transcribe the recorded audio files (per-user if available)
     # NOTE: We keep the session in memory until transcription completes
-    if audio_file and os.path.exists(audio_file):
+    
+    # Re-check session exists (it might have been lost)
+    if voice_channel_id not in recording_sessions:
+        logger.warning(f'Session lost before transcription, using saved audio file: {saved_audio_file}')
+        # Use saved values
+        audio_file = saved_audio_file
+        started_at = saved_started_at
+        channel_name = saved_channel_name
+        user_audio_files = {}
+    else:
+        session = recording_sessions[voice_channel_id]
+        # Wait a bit more for callback to complete and set user_audio_files
+        await asyncio.sleep(2)
+        user_audio_files = session.get('user_audio_files', {})
+        audio_file = session.get('audio_file', saved_audio_file)
+        started_at = session.get('started_at', saved_started_at)
+        channel_name = session.get('channel_name', saved_channel_name)
+    
+    logger.info(f'Checking for user audio files: {len(user_audio_files)} found')
+    logger.debug(f'User audio files: {list(user_audio_files.keys()) if user_audio_files else "None"}')
+    logger.debug(f'Session keys: {list(session.keys())}')
+    
+    if user_audio_files:
+        # Transcribe each user separately
+        await ctx.send(f"📝 Transcribing audio for {len(user_audio_files)} participant(s)... This may take a moment.")
+        
+        user_transcriptions = {}
+        user_summaries = {}
+        
+        try:
+            for user_id, user_audio_path in user_audio_files.items():
+                if not os.path.exists(user_audio_path):
+                    logger.warning(f'User audio file not found: {user_audio_path}')
+                    continue
+                
+                file_size = os.path.getsize(user_audio_path)
+                if file_size < 1000:
+                    logger.warning(f'User {user_id} audio file too small: {file_size} bytes')
+                    continue
+                
+                # Get user name - try multiple methods
+                username = f"User {user_id}"  # Default fallback
+                
+                # Try to get from guild members first (most reliable)
+                if ctx.guild:
+                    try:
+                        member = ctx.guild.get_member(user_id)
+                        if not member:
+                            # Try fetching if not in cache
+                            try:
+                                member = await ctx.guild.fetch_member(user_id)
+                            except Exception as fetch_error:
+                                logger.debug(f'Could not fetch member {user_id}: {fetch_error}')
+                        if member:
+                            username = member.display_name or member.name
+                            logger.info(f'✓ Got username from guild member: {username} (was: User {user_id})')
+                    except Exception as e:
+                        logger.debug(f'Error getting member from guild: {e}')
+                
+                # Fallback to bot's user cache
+                if username == f"User {user_id}":
+                    user = bot.get_user(user_id)
+                    if user:
+                        username = user.display_name or user.name
+                        logger.debug(f'Got username from bot cache: {username}')
+                
+                # If still not found, try fetching from voice channel
+                if username == f"User {user_id}" and voice_channel_id:
+                    try:
+                        voice_channel = bot.get_channel(voice_channel_id)
+                        if voice_channel and hasattr(voice_channel, 'members'):
+                            for member in voice_channel.members:
+                                if member.id == user_id:
+                                    username = member.display_name or member.name
+                                    logger.debug(f'Got username from voice channel: {username}')
+                                    break
+                    except Exception as e:
+                        logger.debug(f'Could not fetch from voice channel: {e}')
+                
+                logger.info(f'Transcribing audio for {username} (user_id: {user_id})')
+                
+                try:
+                    # Read and transcribe user's audio
+                    with open(user_audio_path, 'rb') as f:
+                        audio_data = f.read()
+                    
+                    audio_buffer = io.BytesIO(audio_data)
+                    audio_buffer.seek(0)
+                    
+                    transcription_text = await transcriber.transcribe_audio(audio_buffer, user_id)
+                    
+                    logger.info(f'Transcription for {username}: type={type(transcription_text)}, value={repr(transcription_text[:100]) if transcription_text else None}, length={len(transcription_text) if transcription_text else 0}')
+                    
+                    if transcription_text and transcription_text.strip():
+                        user_transcriptions[user_id] = {
+                            'user_id': user_id,
+                            'username': username,
+                            'text': transcription_text,
+                            'timestamp': started_at
+                        }
+                        logger.info(f'✓ Transcribed {username}: {len(transcription_text)} characters')
+                        logger.info(f'Transcription preview: {transcription_text[:200]}')
+                    else:
+                        logger.error(f'❌ Transcription failed for {username}!')
+                        logger.error(f'  - Audio file: {user_audio_path} ({file_size} bytes)')
+                        logger.error(f'  - Transcription result: {repr(transcription_text)}')
+                        logger.error(f'  - This might be a Whisper issue - audio exists but no text detected')
+                        # DON'T skip - try to use it anyway if it's not None
+                        if transcription_text is not None:  # Even if empty string, try to use it
+                            logger.warning(f'Using empty transcription for {username} (might contain non-printable characters)')
+                            user_transcriptions[user_id] = {
+                                'user_id': user_id,
+                                'username': username,
+                                'text': transcription_text,  # Use it even if empty
+                                'timestamp': started_at
+                            }
+                        
+                except Exception as e:
+                    logger.error(f'Error transcribing {username}: {e}', exc_info=True)
+                    continue
+            
+            # Generate per-person summaries
+            if user_transcriptions:
+                await ctx.send("🤖 Generating individual summaries and task lists...")
+                
+                for user_id, transcription_data in user_transcriptions.items():
+                    username = transcription_data['username']
+                    text = transcription_data['text']
+                    
+                    try:
+                        logger.info(f'Generating summary for {username}...')
+                        person_summary = await summarizer.summarize_person_tasks(
+                            text, 
+                            username, 
+                            language=None
+                        )
+                        user_summaries[user_id] = {
+                            'username': username,
+                            'summary': person_summary,
+                            'transcription': text
+                        }
+                        logger.info(f'✓ Generated summary for {username}')
+                    except Exception as e:
+                        logger.error(f'Error generating summary for {username}: {e}')
+                        user_summaries[user_id] = {
+                            'username': username,
+                            'summary': f"Error generating summary: {str(e)}",
+                            'transcription': text
+                        }
+                
+                # Display results
+                await display_person_summaries(ctx, user_summaries, channel_name, started_at)
+                
+                # Only generate combined summary if there are multiple participants
+                # (to avoid duplication when there's only one person)
+                if len(user_transcriptions) > 1:
+                    all_transcriptions = [t for t in user_transcriptions.values()]
+                    try:
+                        await summarize_transcriptions(ctx, all_transcriptions, channel_name)
+                    except Exception as e:
+                        logger.error(f'Error saving combined note: {e}', exc_info=True)
+                        # Don't fail the whole process if combined note fails
+                else:
+                    # For single participant, also show the general summary
+                    logger.info('Single participant detected - generating general summary...')
+                    all_transcriptions = [t for t in user_transcriptions.values()]
+                    try:
+                        # Generate and show the general summary
+                        logger.info(f'Formatting {len(all_transcriptions)} transcriptions for general summary...')
+                        formatted_transcriptions = [format_transcription_for_summary(t) for t in all_transcriptions]
+                        conversation_text = '\n'.join(formatted_transcriptions)
+                        logger.info(f'Conversation text length: {len(conversation_text)} characters')
+                        
+                        logger.info('Calling summarizer.summarize() for general summary...')
+                        summary = await summarizer.summarize(conversation_text, channel_name, language=None)
+                        logger.info(f'General summary generated: {len(summary)} characters')
+                        
+                        note = note_manager.save_note(
+                            channel_id=ctx.channel.id,
+                            channel_name=channel_name,
+                            messages=all_transcriptions,
+                            summary=summary,
+                            timestamp=datetime.now()
+                        )
+                        logger.info(f'Note saved with ID: {note["id"]}')
+                        
+                        # Show the general summary
+                        logger.info('Sending general summary embed to Discord...')
+                        embed = discord.Embed(
+                            title=f"📝 Summary: {channel_name}",
+                            description=summary,
+                            color=discord.Color.blue(),
+                            timestamp=datetime.now()
+                        )
+                        embed.add_field(name="Transcriptions", value=len(all_transcriptions), inline=True)
+                        embed.add_field(name="Note ID", value=note['id'], inline=True)
+                        embed.set_footer(text="AI Notetaker Bot")
+                        await ctx.send(embed=embed)
+                        logger.info(f'✓ General summary sent to Discord successfully')
+                    except Exception as e:
+                        logger.error(f'❌ CRITICAL ERROR saving/showing general summary: {e}', exc_info=True)
+                        await ctx.send(f"⚠️ Error generating general summary: {str(e)}")
+            else:
+                logger.warning('No transcriptions collected from any users')
+                logger.warning('Falling back to combined audio file transcription')
+                # Clear user_audio_files flag so we try combined file - DON'T remove session yet
+                user_audio_files = {}
+            
+            # Only remove session if we successfully got transcriptions
+            if user_transcriptions:
+                if voice_channel_id in recording_sessions:
+                    del recording_sessions[voice_channel_id]
+                    logger.debug(f'Removed session for channel {voice_channel_id} after transcription')
+                
+        except Exception as e:
+            logger.error(f'Error processing per-user transcriptions: {e}', exc_info=True)
+            logger.warning('Falling back to combined audio file transcription')
+            # Fall through to try combined file as backup - DON'T remove session yet
+            user_audio_files = {}
+    
+    # Fallback: Use combined audio file if per-user files not available or failed
+    if not user_audio_files and audio_file and os.path.exists(audio_file):
+        # Fallback to combined transcription if per-user files not available
         file_size = os.path.getsize(audio_file)
         logger.info(f'Starting transcription of {os.path.basename(audio_file)} ({file_size} bytes)')
         
-        # Check if file has content
         if file_size == 0:
             logger.error(f'Audio file is empty: {audio_file}')
             await ctx.send("⚠️ Audio file was created but is empty. Please check your microphone settings.")
+            if voice_channel_id in recording_sessions:
+                del recording_sessions[voice_channel_id]
             return
         
+        logger.info(f'Using combined audio file (fallback mode): {audio_file}')
         await ctx.send("📝 Transcribing audio... This may take a moment.")
 
         try:
-            # Read the audio file and transcribe
             with open(audio_file, 'rb') as f:
                 audio_data = f.read()
+            
+            logger.debug(f'Read {len(audio_data)} bytes from combined audio file')
                 
-            if not audio_data or len(audio_data) < 1000:  # Too small to contain audio
+            if not audio_data or len(audio_data) < 1000:
                 logger.warning(f'Audio file too small: {len(audio_data)} bytes')
                 await ctx.send("⚠️ Audio file appears to be empty or too small.")
+                if voice_channel_id in recording_sessions:
+                    del recording_sessions[voice_channel_id]
                 return
                 
             audio_buffer = io.BytesIO(audio_data)
             audio_buffer.seek(0)
 
-            # Transcribe the entire recording
-            logger.debug(f'Calling transcriber with {len(audio_data)} bytes of audio data')
-            logger.info(f'Starting transcription process...')
+            logger.info('Starting transcription of combined audio...')
+            logger.info(f'Audio file details: {os.path.basename(audio_file)}, {len(audio_data)} bytes')
             
-            try:
-                logger.info(f'Transcriber model: {transcriber.model_name}')
-                logger.info(f'Calling transcribe_audio...')
-                transcription_text = await transcriber.transcribe_audio(audio_buffer, 0)  # user_id 0 for combined
-                logger.info(f'Transcription returned: {type(transcription_text)}')
-                logger.info(f'Transcription is None: {transcription_text is None}')
-                logger.info(f'Transcription length: {len(transcription_text) if transcription_text else 0}')
-                if transcription_text:
-                    logger.info(f'Transcription stripped length: {len(transcription_text.strip())}')
-                    logger.info(f'Transcription first 100 chars: {repr(transcription_text[:100])}')
-            except Exception as transcribe_error:
-                logger.error(f'Error during transcription: {transcribe_error}', exc_info=True)
-                await ctx.send(f"❌ Error during transcription: {str(transcribe_error)}")
-                return
-
-            # Check transcription result more carefully
-            if transcription_text is not None and len(transcription_text.strip()) > 0:
-                logger.info(f'✓ Transcription completed! Length: {len(transcription_text)} characters')
-                logger.debug(f'Transcription preview: {transcription_text[:150]}...')
-
-                # Format as conversation
-                transcription_entry = {
-                    'user_id': 0,  # Combined transcription
-                    'text': transcription_text,
-                    'timestamp': started_at
-                }
-
-                # Generate summary
-                logger.debug('Proceeding to summary generation...')
-                await summarize_transcriptions(ctx, [transcription_entry], channel_name)
+            transcription_text = await transcriber.transcribe_audio(audio_buffer, 0)
+            
+            logger.info(f'Transcription result: type={type(transcription_text)}, value={repr(transcription_text[:200]) if transcription_text else None}, length={len(transcription_text) if transcription_text else 0}')
+            
+            # More lenient check - accept any non-None result
+            if transcription_text is not None:
+                # Even if empty string, try to process it (might have whitespace-only content)
+                stripped = transcription_text.strip() if transcription_text else ""
+                if stripped:
+                    logger.info(f'✓ Transcription successful: {len(transcription_text)} characters')
+                    logger.info(f'Transcription preview: {transcription_text[:200]}')
+                    transcription_entry = {
+                        'user_id': 0,
+                        'text': transcription_text,
+                        'timestamp': started_at
+                    }
+                    await summarize_transcriptions(ctx, [transcription_entry], channel_name)
+                else:
+                    # Empty or whitespace-only - this is a real problem
+                    logger.error(f'❌ CRITICAL: Transcription returned empty/whitespace string!')
+                    logger.error(f'  - Audio file: {audio_file} ({len(audio_data)} bytes)')
+                    logger.error(f'  - Transcription type: {type(transcription_text)}')
+                    logger.error(f'  - Transcription value: {repr(transcription_text)}')
+                    logger.error(f'  - This means Whisper processed the audio but found no speech')
+                    logger.error(f'  - Possible causes: audio too quiet, wrong format, or Whisper model issue')
+                    await ctx.send("⚠️ No speech was detected in the recording. Check bot logs for details.")
             else:
-                logger.warning('No speech detected in recording')
-                logger.warning(f'Audio file size: {file_size} bytes, but transcription returned: {repr(transcription_text)}')
-                logger.warning('This could mean:')
-                logger.warning('1. The audio file is corrupted or in wrong format')
-                logger.warning('2. Whisper model failed to process the audio')
-                logger.warning('3. The audio contains only silence or noise')
-                await ctx.send("⚠️ No speech was detected in the recording. The audio file was created but Whisper couldn't detect any speech. Check bot logs for details.")
+                # None result - transcription failed completely
+                logger.error(f'❌ CRITICAL: Transcription returned None!')
+                logger.error(f'  - Audio file: {audio_file} ({len(audio_data)} bytes)')
+                logger.error(f'  - This means Whisper failed to process the audio')
+                logger.error(f'  - Possible causes: audio format issue, file corruption, or Whisper error')
+                await ctx.send("⚠️ Transcription failed. Check bot logs for details.")
             
-            # Remove session after transcription completes
             if voice_channel_id in recording_sessions:
                 del recording_sessions[voice_channel_id]
-                logger.debug(f'Removed session for channel {voice_channel_id} after transcription')
-
+                
         except Exception as e:
             logger.error(f'Error transcribing audio file: {e}', exc_info=True)
             await ctx.send(f"❌ Error transcribing audio: {str(e)}")
-            # Remove session even on error
             if voice_channel_id in recording_sessions:
                 del recording_sessions[voice_channel_id]
     else:
-        await ctx.send("⚠️ No audio file was recorded.")
-        # Remove session if no audio file
+        # Transcription already happened above, don't show any error message
+        logger.debug('Reached else block - transcription already completed')
         if voice_channel_id in recording_sessions:
             del recording_sessions[voice_channel_id]
 

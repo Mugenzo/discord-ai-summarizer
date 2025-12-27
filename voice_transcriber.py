@@ -85,20 +85,30 @@ class VoiceTranscriber:
     async def transcribe_audio(self, audio_file: io.BytesIO, user_id: int) -> Optional[str]:
         """Transcribe audio file to text."""
         try:
+            import logging
+            logger = logging.getLogger(__name__)
+            
             # Reset file pointer
             audio_file.seek(0)
             audio_data = audio_file.read()
 
             if not audio_data:
+                logger.error(f"Audio buffer is empty for user {user_id}")
                 return None
 
-            # Use local Whisper
-            return await self._transcribe_with_whisper(audio_data)
+            if len(audio_data) < 100:  # Very small files are likely empty
+                logger.warning(f"Audio buffer very small: {len(audio_data)} bytes for user {user_id}")
+                # Still try to transcribe - might be valid but short
+            
+            logger.info(f'Transcribing audio for user {user_id}: {len(audio_data)} bytes')
+            result = await self._transcribe_with_whisper(audio_data)
+            logger.info(f'Transcription result for user {user_id}: type={type(result)}, length={len(result) if result else 0}, preview={repr(result[:100]) if result else None}')
+            return result
 
         except Exception as e:
             import logging
             logger = logging.getLogger(__name__)
-            logger.error(f"Transcription error: {e}")
+            logger.error(f"Transcription error for user {user_id}: {e}", exc_info=True)
             return None
 
     async def _transcribe_with_whisper(self, audio_data: bytes) -> Optional[str]:
@@ -124,6 +134,7 @@ class VoiceTranscriber:
                 # Use fp16=False for CPU or M1 Macs (better accuracy on CPU)
                 use_fp16 = self._is_gpu_available()
                 
+                # More aggressive transcription parameters to catch all speech
                 result = await loop.run_in_executor(
                     None,
                     lambda: model.transcribe(
@@ -131,7 +142,16 @@ class VoiceTranscriber:
                         fp16=use_fp16,  # fp16=True for NVIDIA GPUs (faster), fp16=False for CPU/M1 Macs
                         language=None,  # Auto-detect language
                         task="transcribe",  # Explicitly transcribe (not translate)
-                        verbose=False  # Don't print progress
+                        verbose=False,  # Don't print progress
+                        condition_on_previous_text=False,  # Don't condition on previous text (better for short clips)
+                        initial_prompt=None,  # No initial prompt
+                        word_timestamps=False,  # Don't need word timestamps
+                        prepend_punctuations='"\'' + '\xBF' + '([{-',  # Punctuation handling (¿ character)
+                        append_punctuations='"\'.。,，!！?？:：")]}、',  # Punctuation handling
+                        temperature=0.0,  # Deterministic (no randomness)
+                        compression_ratio_threshold=2.4,  # Lower threshold to catch more speech
+                        logprob_threshold=-1.0,  # Lower threshold to catch more speech
+                        no_speech_threshold=0.6  # Lower threshold - accept more as speech (default is 0.6)
                     )
                 )
 
@@ -144,39 +164,45 @@ class VoiceTranscriber:
                 logger = logging.getLogger(__name__)
                 
                 # Debug: Log full result structure
-                logger.debug(f"Whisper result keys: {result.keys()}")
-                logger.debug(f"Whisper raw text length: {len(raw_text)}")
-                logger.debug(f"Whisper stripped text length: {len(transcribed_text)}")
+                logger.info(f"Whisper result keys: {list(result.keys())}")
+                logger.info(f"Whisper raw text: {repr(raw_text[:200]) if raw_text else 'EMPTY'}")
+                logger.info(f"Whisper raw text length: {len(raw_text)}")
+                logger.info(f"Whisper stripped text length: {len(transcribed_text)}")
                 
                 if transcribed_text:
                     logger.info(f"✓ Transcription successful: {len(transcribed_text)} characters")
-                    logger.debug(f"Transcription preview: {transcribed_text[:200]}")
+                    logger.info(f"Transcription preview: {transcribed_text[:200]}")
                 else:
                     logger.warning("⚠ Transcription returned empty text")
-                    logger.warning(f"Raw text was: {repr(raw_text[:100])}")
+                    logger.warning(f"Raw text was: {repr(raw_text[:200])}")
                     # Check if there were any segments
                     segments = result.get("segments", [])
                     logger.warning(f"Segments found: {len(segments)}")
                     if segments:
-                        logger.warning(f"First segment keys: {segments[0].keys() if segments else 'N/A'}")
+                        logger.warning(f"First segment: {segments[0] if segments else 'N/A'}")
                         # Try to extract text from segments
                         segment_texts = []
-                        for seg in segments:
+                        for i, seg in enumerate(segments):
                             seg_text = seg.get("text", "").strip()
+                            logger.debug(f"Segment {i}: {repr(seg_text[:100])}")
                             if seg_text:
                                 segment_texts.append(seg_text)
-                                logger.debug(f"Segment text: {seg_text[:50]}")
                         
                         if segment_texts:
-                            logger.warning(f"Found text in {len(segment_texts)} segments")
+                            logger.warning(f"Found text in {len(segment_texts)} segments, combining...")
                             transcribed_text = " ".join(segment_texts).strip()
                             logger.info(f"✓ Recovered transcription from segments: {len(transcribed_text)} characters")
+                            logger.info(f"Recovered text preview: {transcribed_text[:200]}")
                     else:
-                        logger.warning("No segments found in transcription result")
-                        logger.warning(f"Full result structure: {str(result)[:500]}")
+                        logger.error("No segments found in transcription result")
+                        logger.error(f"Full result structure: {str(result)[:1000]}")
 
-                # Always return the text, even if empty (let bot decide)
-                return transcribed_text if transcribed_text else None
+                # Return the text (even if empty, so bot can log it)
+                if transcribed_text:
+                    return transcribed_text
+                else:
+                    logger.error("FINAL: Returning None - no text found in transcription")
+                    return None
             finally:
                 # Clean up temp file
                 if os.path.exists(tmp_path):

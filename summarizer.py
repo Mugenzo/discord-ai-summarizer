@@ -154,6 +154,112 @@ Summary (in {language_name}):"""
                     if not summary:
                         raise Exception("Empty response from Ollama")
 
+                    # Remove translation text if LLM added it despite instructions
+                    import re
+                    # Remove (Translation: ...) patterns
+                    summary = re.sub(r'\(Translation:\s*[^)]+\)', '', summary, flags=re.IGNORECASE)
+                    # Remove standalone "Translation:" lines
+                    summary = re.sub(r'^Translation:\s*.*$', '', summary, flags=re.IGNORECASE | re.MULTILINE)
+                    summary = summary.strip()
+
+                    return summary
+
+        except aiohttp.ClientError as e:
+            raise Exception(f"Connection error: {str(e)}")
+        except Exception as e:
+            raise Exception(f"Summarization error: {str(e)}")
+
+    async def summarize_person_tasks(self, person_text: str, person_name: str, language: Optional[str] = None) -> str:
+        """
+        Generate a summary focused on a specific person's contributions and tasks.
+
+        Args:
+            person_text: The transcription text from this person
+            person_name: Name of the person
+            language: Optional language code. If None, will be auto-detected.
+
+        Returns:
+            Summary string with tasks and contributions
+        """
+        # Detect language if not provided
+        if language is None:
+            language = self._detect_language(person_text)
+
+        language_name = self._get_language_name(language)
+
+        # Create prompt focused on person's tasks and contributions
+        if language == 'en':
+            prompt = f"""You are a helpful assistant that analyzes individual contributions in a meeting/discussion.
+
+Person: {person_name}
+
+Below is what {person_name} said during the discussion. Please provide a concise summary that focuses on:
+1. What topics or issues {person_name} discussed
+2. What decisions or opinions {person_name} expressed
+3. What tasks, action items, or responsibilities {person_name} mentioned or was assigned
+4. Any questions {person_name} raised
+5. Any commitments or promises {person_name} made
+
+Person's contributions:
+{person_text}
+
+Summary for {person_name}:"""
+        else:
+            prompt = f"""You are a helpful assistant that analyzes individual contributions in a meeting/discussion.
+
+Person: {person_name}
+Language: {language_name}
+
+Below is what {person_name} said during the discussion (in {language_name}). Please provide a concise summary IN {language_name.upper()} that focuses on:
+1. What topics or issues {person_name} discussed
+2. What decisions or opinions {person_name} expressed
+3. What tasks, action items, or responsibilities {person_name} mentioned or was assigned
+4. Any questions {person_name} raised
+5. Any commitments or promises {person_name} made
+
+IMPORTANT: 
+- Write the summary in {language_name}, the same language as the conversation.
+- DO NOT add translations or "(Translation: ...)" text.
+- Write ONLY the summary in {language_name}, nothing else.
+
+Person's contributions:
+{person_text}
+
+Summary for {person_name} (in {language_name}):"""
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f'{self.api_url}/api/generate',
+                    json={
+                        'model': self.model,
+                        'prompt': prompt,
+                        'stream': False,
+                        'options': {
+                            'temperature': 0.3,
+                            'top_p': 0.9,
+                        }
+                    },
+                    timeout=aiohttp.ClientTimeout(total=120)
+                ) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        raise Exception(f"Ollama API error: {response.status} - {error_text}")
+
+                    result = await response.json()
+                    summary = result.get('response', '').strip()
+
+                    if not summary:
+                        raise Exception("Empty response from Ollama")
+
+                    # Remove translation text if LLM added it despite instructions
+                    import re
+                    # Remove (Translation: ...) patterns
+                    summary = re.sub(r'\(Translation:\s*[^)]+\)', '', summary, flags=re.IGNORECASE)
+                    # Remove standalone "Translation:" lines
+                    summary = re.sub(r'^Translation:\s*.*$', '', summary, flags=re.IGNORECASE | re.MULTILINE)
+                    summary = summary.strip()
+
                     return summary
 
         except aiohttp.ClientError as e:
