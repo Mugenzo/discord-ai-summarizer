@@ -25,7 +25,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from summarizer import LocalSummarizer
-from note_manager import NoteManager
+from database_manager import DatabaseManager
 from voice_transcriber import VoiceTranscriber
 
 # Load environment variables
@@ -103,7 +103,7 @@ WHISPER_MODEL = os.getenv('WHISPER_MODEL', 'medium')  # Options: tiny, base, sma
 
 # Initialize components
 summarizer = LocalSummarizer(OLLAMA_API_URL, OLLAMA_MODEL)
-note_manager = NoteManager()
+db_manager = DatabaseManager()
 transcriber = VoiceTranscriber(OLLAMA_API_URL, WHISPER_MODEL)
 
 # Track active voice recording sessions
@@ -241,8 +241,8 @@ async def display_person_summaries(ctx: commands.Context, user_summaries: Dict[i
             await ctx.send(embed=person_embed)
 
 
-async def summarize_transcriptions(ctx: commands.Context, transcriptions: List[Dict], channel_name: str):
-    """Summarize collected transcriptions and save as a note."""
+async def summarize_transcriptions(ctx: commands.Context, transcriptions: List[Dict], channel_name: str, discussion_id: Optional[int] = None):
+    """Summarize collected transcriptions and save to database."""
     if not transcriptions:
         await ctx.send("No transcriptions collected to summarize.")
         return
@@ -261,15 +261,14 @@ async def summarize_transcriptions(ctx: commands.Context, transcriptions: List[D
         logger.info(f'Summary generated successfully! Length: {len(summary)} characters')
         logger.debug(f'Summary preview: {summary[:100]}...')
 
-        # Save the note (we'll store transcriptions as a list of dicts)
-        note = note_manager.save_note(
-            channel_id=ctx.channel.id,
-            channel_name=channel_name,
-            messages=transcriptions,  # Store transcriptions instead of messages
-            summary=summary,
-            timestamp=datetime.now()
-        )
-        logger.info(f'Note saved with ID: {note["id"]}')
+        # Save general summary to database
+        if discussion_id:
+            db_manager.add_summary(
+                discussion_id=discussion_id,
+                summary_text=summary,
+                summary_type='general'
+            )
+            logger.info(f'✓ Saved general summary to database for discussion {discussion_id}')
 
         # Send summary to channel
         embed = discord.Embed(
@@ -279,7 +278,8 @@ async def summarize_transcriptions(ctx: commands.Context, transcriptions: List[D
             timestamp=datetime.now()
         )
         embed.add_field(name="Transcriptions", value=len(transcriptions), inline=True)
-        embed.add_field(name="Note ID", value=note['id'], inline=True)
+        if discussion_id:
+            embed.add_field(name="Discussion ID", value=discussion_id, inline=True)
         embed.set_footer(text="AI Notetaker Bot")
 
         await ctx.send(embed=embed)
@@ -402,13 +402,27 @@ async def cmd_start(ctx: commands.Context):
             voice_channel_id
         )
 
+        # Create discussion record in database
+        started_at = datetime.now()
+        started_by_username = ctx.author.display_name or ctx.author.name
+        discussion_id = db_manager.create_discussion(
+            voice_channel_id=voice_channel_id,
+            channel_name=voice_channel.name,
+            started_by_user_id=ctx.author.id,
+            started_by_username=started_by_username,
+            started_at=started_at,
+            guild_id=ctx.guild.id if ctx.guild else None
+        )
+        
         session = {
             'voice_client': voice_client,
             'channel_name': voice_channel.name,
-            'started_at': datetime.now(),
+            'started_at': started_at,
             'started_by': ctx.author.id,
+            'started_by_username': started_by_username,
             'audio_file': audio_filename,
-            'sink': sink
+            'sink': sink,
+            'discussion_id': discussion_id  # Store discussion ID in session
         }
         recording_sessions[voice_channel_id] = session
 
@@ -537,11 +551,13 @@ async def cmd_stop(ctx: commands.Context):
     audio_file = session.get('audio_file')
     started_at = session.get('started_at', datetime.now())
     channel_name = session.get('channel_name', 'Unknown Channel')
+    discussion_id = session.get('discussion_id')  # Get discussion ID from session
     
     # Save these values in case session gets deleted
     saved_audio_file = audio_file
     saved_started_at = started_at
     saved_channel_name = channel_name
+    saved_discussion_id = discussion_id
 
     # Stop recording
     try:
@@ -605,8 +621,20 @@ async def cmd_stop(ctx: commands.Context):
     # Disconnect from voice channel (but keep session for transcription)
     await voice_client.disconnect()
 
+    # Update discussion with end time and duration
+    ended_at = datetime.now()
+    duration = (ended_at - started_at).total_seconds()
+    
+    if discussion_id:
+        # Update discussion with end time
+        db_manager.update_discussion(
+            discussion_id=discussion_id,
+            ended_at=ended_at,
+            duration_seconds=duration
+        )
+        logger.info(f'Updated discussion {discussion_id} with end time and duration')
+
     # Show session info
-    duration = (datetime.now() - started_at).total_seconds()
     embed = discord.Embed(
         title="🛑 Stopped Recording",
         description=f"Session duration: {duration:.0f} seconds",
@@ -625,12 +653,23 @@ async def cmd_stop(ctx: commands.Context):
         audio_file = saved_audio_file
         started_at = saved_started_at
         channel_name = saved_channel_name
+        discussion_id = saved_discussion_id
         user_audio_files = {}
     else:
         session = recording_sessions[voice_channel_id]
+        discussion_id = session.get('discussion_id', saved_discussion_id)
         # Wait a bit more for callback to complete and set user_audio_files
         await asyncio.sleep(2)
         user_audio_files = session.get('user_audio_files', {})
+        
+        # Update discussion with audio file paths
+        if discussion_id and user_audio_files:
+            db_manager.update_discussion(
+                discussion_id=discussion_id,
+                combined_audio_file=audio_file,
+                user_audio_files=user_audio_files
+            )
+            logger.info(f'Updated discussion {discussion_id} with audio file paths')
         audio_file = session.get('audio_file', saved_audio_file)
         started_at = session.get('started_at', saved_started_at)
         channel_name = session.get('channel_name', saved_channel_name)
@@ -717,6 +756,17 @@ async def cmd_stop(ctx: commands.Context):
                             'text': transcription_text,
                             'timestamp': started_at
                         }
+                        # Save transcription to database
+                        if discussion_id:
+                            db_manager.add_transcription(
+                                discussion_id=discussion_id,
+                                user_id=user_id,
+                                transcription_text=transcription_text,
+                                username=username,
+                                audio_file_path=user_audio_path,
+                                timestamp=started_at
+                            )
+                            logger.info(f'✓ Saved transcription to database for {username}')
                         logger.info(f'✓ Transcribed {username}: {len(transcription_text)} characters')
                         logger.info(f'Transcription preview: {transcription_text[:200]}')
                     else:
@@ -733,6 +783,16 @@ async def cmd_stop(ctx: commands.Context):
                                 'text': transcription_text,  # Use it even if empty
                                 'timestamp': started_at
                             }
+                            # Save even empty transcription to database
+                            if discussion_id:
+                                db_manager.add_transcription(
+                                    discussion_id=discussion_id,
+                                    user_id=user_id,
+                                    transcription_text=transcription_text,
+                                    username=username,
+                                    audio_file_path=user_audio_path,
+                                    timestamp=started_at
+                                )
                         
                 except Exception as e:
                     logger.error(f'Error transcribing {username}: {e}', exc_info=True)
@@ -758,6 +818,16 @@ async def cmd_stop(ctx: commands.Context):
                             'summary': person_summary,
                             'transcription': text
                         }
+                        # Save per-person summary to database
+                        if discussion_id:
+                            db_manager.add_summary(
+                                discussion_id=discussion_id,
+                                summary_text=person_summary,
+                                summary_type='person',
+                                user_id=user_id,
+                                username=username
+                            )
+                            logger.info(f'✓ Saved person summary to database for {username}')
                         logger.info(f'✓ Generated summary for {username}')
                     except Exception as e:
                         logger.error(f'Error generating summary for {username}: {e}')
@@ -775,7 +845,7 @@ async def cmd_stop(ctx: commands.Context):
                 if len(user_transcriptions) > 1:
                     all_transcriptions = [t for t in user_transcriptions.values()]
                     try:
-                        await summarize_transcriptions(ctx, all_transcriptions, channel_name)
+                        await summarize_transcriptions(ctx, all_transcriptions, channel_name, discussion_id)
                     except Exception as e:
                         logger.error(f'Error saving combined note: {e}', exc_info=True)
                         # Don't fail the whole process if combined note fails
@@ -794,14 +864,14 @@ async def cmd_stop(ctx: commands.Context):
                         summary = await summarizer.summarize(conversation_text, channel_name, language=None)
                         logger.info(f'General summary generated: {len(summary)} characters')
                         
-                        note = note_manager.save_note(
-                            channel_id=ctx.channel.id,
-                            channel_name=channel_name,
-                            messages=all_transcriptions,
-                            summary=summary,
-                            timestamp=datetime.now()
-                        )
-                        logger.info(f'Note saved with ID: {note["id"]}')
+                        # Save general summary to database
+                        if discussion_id:
+                            db_manager.add_summary(
+                                discussion_id=discussion_id,
+                                summary_text=summary,
+                                summary_type='general'
+                            )
+                            logger.info(f'✓ Saved general summary to database for discussion {discussion_id}')
                         
                         # Show the general summary
                         logger.info('Sending general summary embed to Discord...')
@@ -812,7 +882,8 @@ async def cmd_stop(ctx: commands.Context):
                             timestamp=datetime.now()
                         )
                         embed.add_field(name="Transcriptions", value=len(all_transcriptions), inline=True)
-                        embed.add_field(name="Note ID", value=note['id'], inline=True)
+                        if discussion_id:
+                            embed.add_field(name="Discussion ID", value=discussion_id, inline=True)
                         embed.set_footer(text="AI Notetaker Bot")
                         await ctx.send(embed=embed)
                         logger.info(f'✓ General summary sent to Discord successfully')
@@ -888,7 +959,18 @@ async def cmd_stop(ctx: commands.Context):
                         'text': transcription_text,
                         'timestamp': started_at
                     }
-                    await summarize_transcriptions(ctx, [transcription_entry], channel_name)
+                    # Save combined transcription to database
+                    if discussion_id:
+                        db_manager.add_transcription(
+                            discussion_id=discussion_id,
+                            user_id=0,
+                            transcription_text=transcription_text,
+                            username='Combined Audio',
+                            audio_file_path=audio_file,
+                            timestamp=started_at
+                        )
+                        logger.info(f'✓ Saved combined transcription to database')
+                    await summarize_transcriptions(ctx, [transcription_entry], channel_name, discussion_id)
                 else:
                     # Empty or whitespace-only - this is a real problem
                     logger.error(f'❌ CRITICAL: Transcription returned empty/whitespace string!')
@@ -966,65 +1048,116 @@ async def cmd_status(ctx: commands.Context):
 
 @bot.command(name='notes', aliases=['listnotes'])
 async def cmd_list_notes(ctx: commands.Context, limit: int = 10):
-    """List recent notes."""
-    notes = note_manager.get_notes_for_channel(ctx.channel.id, limit=limit)
+    """List recent discussions for the current voice channel."""
+    # Get voice channel ID from context
+    voice_channel_id = None
+    if ctx.author.voice and ctx.author.voice.channel:
+        voice_channel_id = ctx.author.voice.channel.id
+    else:
+        # Try to find any voice channel in the guild
+        if ctx.guild:
+            for channel in ctx.guild.voice_channels:
+                voice_channel_id = channel.id
+                break
+    
+    if not voice_channel_id:
+        await ctx.send("❌ Please join a voice channel or specify which channel to list discussions for.")
+        return
 
-    if not notes:
-        await ctx.send("No notes found.")
+    discussions = db_manager.get_discussions_for_channel(voice_channel_id, limit=limit)
+
+    if not discussions:
+        await ctx.send("No discussions found for this channel.")
         return
 
     embed = discord.Embed(
-        title=f"📚 Recent Notes",
+        title=f"📚 Recent Discussions",
         color=discord.Color.green()
     )
 
-    for note in notes[:5]:  # Show up to 5 in embed
-        timestamp = note['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
-        preview = note['summary'][:100] + '...' if len(note['summary']) > 100 else note['summary']
+    for discussion in discussions[:5]:  # Show up to 5 in embed
+        started_at = datetime.fromisoformat(discussion['started_at']) if isinstance(discussion['started_at'], str) else discussion['started_at']
+        timestamp = started_at.strftime('%Y-%m-%d %H:%M:%S')
+        channel_name = discussion['channel_name']
+        duration = f"{discussion['duration_seconds']:.0f}s" if discussion.get('duration_seconds') else "N/A"
         embed.add_field(
-            name=f"Note #{note['id']} - {timestamp}",
-            value=preview,
+            name=f"Discussion #{discussion['id']} - {timestamp}",
+            value=f"Channel: {channel_name}\nDuration: {duration}",
             inline=False
         )
 
-    if len(notes) > 5:
-        embed.set_footer(text=f"Showing 5 of {len(notes)} notes. Use !note <id> to view full note.")
+    if len(discussions) > 5:
+        embed.set_footer(text=f"Showing 5 of {len(discussions)} discussions. Use !discussion <id> to view full details.")
 
     await ctx.send(embed=embed)
 
 
-@bot.command(name='note')
-async def cmd_get_note(ctx: commands.Context, note_id: int):
-    """Get a specific note by ID."""
-    note = note_manager.get_note(note_id)
+@bot.command(name='discussion', aliases=['note'])
+async def cmd_get_discussion(ctx: commands.Context, discussion_id: int):
+    """Get a specific discussion by ID with all transcriptions and summaries."""
+    discussion = db_manager.get_discussion(discussion_id)
 
-    if not note:
-        await ctx.send(f"Note #{note_id} not found.")
+    if not discussion:
+        await ctx.send(f"Discussion #{discussion_id} not found.")
         return
 
+    started_at = datetime.fromisoformat(discussion['started_at']) if isinstance(discussion['started_at'], str) else discussion['started_at']
+    ended_at = datetime.fromisoformat(discussion['ended_at']) if discussion.get('ended_at') and isinstance(discussion['ended_at'], str) else discussion.get('ended_at')
+    
     embed = discord.Embed(
-        title=f"📝 Note #{note_id}",
-        description=note['summary'],
+        title=f"📝 Discussion #{discussion_id}",
+        description=f"**Channel:** {discussion['channel_name']}",
         color=discord.Color.blue(),
-        timestamp=note['timestamp']
+        timestamp=started_at
     )
-    embed.add_field(name="Channel", value=note['channel_name'], inline=True)
-    embed.add_field(name="Items", value=note['message_count'], inline=True)
-
+    
+    embed.add_field(name="Started by", value=discussion.get('started_by_username', f"User {discussion['started_by_user_id']}"), inline=True)
+    embed.add_field(name="Duration", value=f"{discussion.get('duration_seconds', 0):.0f}s" if discussion.get('duration_seconds') else "N/A", inline=True)
+    if ended_at:
+        embed.add_field(name="Ended at", value=ended_at.strftime('%Y-%m-%d %H:%M:%S'), inline=True)
+    
+    # Add transcriptions count
+    transcriptions = discussion.get('transcriptions', [])
+    embed.add_field(name="Transcriptions", value=len(transcriptions), inline=True)
+    
+    # Add summaries info
+    summaries = discussion.get('summaries', [])
+    general_summaries = [s for s in summaries if s.get('summary_type') == 'general']
+    person_summaries = [s for s in summaries if s.get('summary_type') == 'person']
+    embed.add_field(name="General Summaries", value=len(general_summaries), inline=True)
+    embed.add_field(name="Person Summaries", value=len(person_summaries), inline=True)
+    
+    # Show general summary if available
+    if general_summaries:
+        general_summary = general_summaries[0]['summary_text']
+        preview = general_summary[:500] + '...' if len(general_summary) > 500 else general_summary
+        embed.add_field(name="General Summary", value=preview, inline=False)
+    
+    # Show transcription previews
+    if transcriptions:
+        transcription_preview = "\n".join([
+            f"**{t.get('username', 'Unknown')}:** {t['transcription_text'][:100]}..."
+            for t in transcriptions[:3]
+        ])
+        if len(transcriptions) > 3:
+            transcription_preview += f"\n... and {len(transcriptions) - 3} more"
+        embed.add_field(name="Transcription Preview", value=transcription_preview, inline=False)
+    
+    embed.set_footer(text="AI Notetaker Bot")
     await ctx.send(embed=embed)
 
 
 @bot.command(name='stats')
 async def cmd_stats(ctx: commands.Context):
     """Show bot statistics."""
-    total_notes = note_manager.get_total_notes()
+    total_discussions = db_manager.get_total_discussions()
     active_sessions = len(recording_sessions)
 
     embed = discord.Embed(
         title="📊 Bot Statistics",
         color=discord.Color.gold()
     )
-    embed.add_field(name="Total Notes", value=total_notes, inline=True)
+    embed.add_field(name="Total Discussions", value=total_discussions, inline=True)
     embed.add_field(name="Active Recording Sessions", value=active_sessions, inline=True)
     embed.add_field(name="Model", value=OLLAMA_MODEL, inline=True)
 

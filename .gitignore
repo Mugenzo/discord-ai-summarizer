@@ -1,3 +1,7 @@
 __pycache__/
 venv/
 .env
+*.db
+*.db-journal
+notes/discussions.db
+notes/discussions.db-journal
