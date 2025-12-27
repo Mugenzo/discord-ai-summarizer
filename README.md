@@ -16,12 +16,21 @@ An intelligent Discord bot that records and transcribes voice channel discussion
 2. **Ollama** installed and running locally
    - Download from: https://ollama.ai
    - Install model: `ollama pull llama3` (for summarization)
+   - **For NVIDIA GPUs**: Ollama will automatically use GPU if CUDA drivers are installed
 3. **Whisper** for speech-to-text transcription
    - Will be installed via pip: `pip install openai-whisper`
+   - **For NVIDIA GPU acceleration**: Install PyTorch with CUDA support:
+     - Visit https://pytorch.org/get-started/locally/
+     - For CUDA 12.x: `pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121`
+     - For CUDA 11.x: `pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118`
+     - Whisper will automatically detect and use GPU if PyTorch with CUDA is installed
 4. **FFmpeg** (required for audio processing)
    - macOS: `brew install ffmpeg`
    - Linux: `sudo apt-get install ffmpeg`
    - Windows: Download from https://ffmpeg.org
+5. **NVIDIA GPU Drivers** (for GPU acceleration)
+   - Ensure latest NVIDIA drivers are installed: https://www.nvidia.com/drivers
+   - Verify CUDA is available: `nvidia-smi` (should show GPU info)
 
 ## Setup
 
@@ -29,6 +38,23 @@ An intelligent Discord bot that records and transcribes voice channel discussion
 
 ```bash
 pip install -r requirements.txt
+```
+
+**For NVIDIA GPU users (RTX 3080, 4080, 5080, etc.):**
+
+After installing requirements, install PyTorch with CUDA support:
+
+```bash
+# For CUDA 12.x (RTX 40/50 series typically)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# OR for CUDA 11.x (older GPUs)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
+
+Verify GPU is detected:
+```bash
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
 ```
 
 ### 2. Create Discord Bot
@@ -143,11 +169,18 @@ Whisper models vary in size, speed, and accuracy:
 | `base` | ~74M | Fast | Good | Quick transcriptions |
 | `small` | ~244M | Medium | Better | Balanced use |
 | `medium` | ~769M | Moderate | **Very Good** | **Recommended default** |
-| `large-v3` | ~1550M | Slower | **Best** | **M1/M2 Macs with 16GB+ RAM** |
+| `large-v3` | ~1550M | Slower | **Best** | **NVIDIA GPUs with 16GB+ VRAM or M1/M2 Macs with 16GB+ RAM** |
 
-**For MacBook M1 with 32GB RAM**, we recommend:
+**For NVIDIA RTX GPUs (RTX 3080, 4080, 5080, etc.) with 16GB+ VRAM:**
+- **`large-v3`** - **Highly recommended** - Best accuracy, very fast with GPU acceleration
+- **`medium`** - Good balance if you have less VRAM (8GB)
+
+**For MacBook M1/M2 with 32GB RAM:**
 - **`large-v3`** for best accuracy (may take longer but worth it)
-- **`medium`** for good balance of speed and accuracy (current default)
+- **`medium`** for good balance of speed and accuracy
+
+**For CPU-only systems:**
+- **`medium`** or **`small`** - CPU transcription is slower, so smaller models are recommended
 
 Set in `.env`: `WHISPER_MODEL=large-v3`
 
@@ -194,6 +227,15 @@ Notes are stored in `notes/notes.json` in JSON format. Each note contains:
 - Check that audio is being recorded (bot should be connected to voice channel)
 - First transcription may take longer as Whisper downloads the model (~150MB for "base" model)
 - Make sure FFmpeg is installed and accessible
+
+### GPU not being used (NVIDIA GPUs)
+- Verify PyTorch with CUDA is installed: `python -c "import torch; print(torch.cuda.is_available())"`
+- Should output `True` if GPU is detected
+- If `False`, install PyTorch with CUDA (see Setup section above)
+- Check NVIDIA drivers are up to date: `nvidia-smi`
+- Verify CUDA version matches PyTorch installation (CUDA 11.x vs 12.x)
+- When bot starts, look for "✓ GPU detected" message in logs (if debug mode is enabled)
+- For RTX 5080/4080/3080: Use `large-v3` model for best performance with GPU
 
 ## Privacy & Security
 
